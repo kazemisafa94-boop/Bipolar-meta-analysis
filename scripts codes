@@ -1,0 +1,754 @@
+1. Configuration and Setup
+r
+
+# Set working directory
+setwd("D:/transcriptome/rowcounts")
+
+# Define dataset names
+datasets <- c("GSE80655", "GSE80336", "GSE202537", "GSE42546")
+
+2. Data Processing Function for All Datasets
+r
+
+# Function to process each dataset
+process_dataset <- function(dataset_name) {
+  cat("Processing dataset:", dataset_name, "\n")
+  
+  # Read count data
+  count_file <- paste0(dataset_name, ".txt")
+  count_data <- read.delim(count_file, header = TRUE)
+  
+  # Read metadata
+  meta_file <- paste0("meta", gsub("GSE", "", dataset_name), ".txt")
+  metadata <- read.delim(meta_file, header = TRUE, sep = "\t")
+  
+  # Remove empty rows and aggregate by gene symbol
+  clean_data <- count_data[!is.na(count_data[,1]) & count_data[,1] != "", ]
+  aggregated_data <- aggregate(. ~ Gene.symbol, data = clean_data, FUN = mean)
+  
+  # Set row names and prepare count matrix
+  rownames(aggregated_data) <- aggregated_data[,1]
+  count_matrix <- aggregated_data[,-1]
+  count_matrix <- round(count_matrix)  # Ensure integer counts
+  
+  # Ensure metadata matches count matrix columns
+  rownames(metadata) <- colnames(count_matrix)
+  
+  # Create DESeq2 object
+  dds <- DESeqDataSetFromMatrix(countData = count_matrix,
+                                colData = metadata,
+                                design = ~ sample.type)
+  
+  # Perform differential expression analysis
+  dds <- DESeq(dds)
+  
+  # Variance stabilizing transformation for visualization
+  vsd <- vst(dds)
+  
+  # Return processed data
+  return(list(
+    dds = dds,
+    vsd = vsd,
+    metadata = metadata,
+    dataset_name = dataset_name
+  ))
+}
+
+# Process all datasets
+processed_data <- lapply(datasets, process_dataset)
+names(processed_data) <- datasets
+
+3. Quality Control for All Datasets
+r
+
+# Generate QC plots for each dataset
+generate_qc_plots <- function(processed_data) {
+  dataset_name <- processed_data$dataset_name
+  vsd <- processed_data$vsd
+  metadata <- processed_data$metadata
+  
+  # Create output directory for this dataset
+  dir.create(paste0("results_", dataset_name), showWarnings = FALSE)
+  
+  # Boxplot of normalized counts
+  png(paste0("results_", dataset_name, "/boxplot_", dataset_name, ".png"))
+  boxplot(assay(vsd), 
+          main = paste("Normalized Expression -", dataset_name),
+          col = RColorBrewer::brewer.pal(ncol(vsd), "Set2"),
+          las = 2)
+  dev.off()
+  
+  # PCA plot
+  pca_data <- plotPCA(vsd, intgroup = "sample.type", returnData = TRUE)
+  percent_var <- round(100 * attr(pca_data, "percentVar"))
+  
+  pca_plot <- ggplot(pca_data, aes(x = PC1, y = PC2, color = group)) +
+    geom_point(size = 3) +
+    xlab(paste0("PC1: ", percent_var[1], "% variance")) +
+    ylab(paste0("PC2: ", percent_var[2], "% variance")) +
+    ggtitle(paste("PCA Plot -", dataset_name)) +
+    theme_minimal()
+  
+  ggsave(paste0("results_", dataset_name, "/pca_", dataset_name, ".png"), pca_plot)
+  
+  # Sample correlation heatmap
+  sample_cor <- cor(assay(vsd), method = "pearson")
+  pheatmap(sample_cor,
+           clustering_method = "complete",
+           main = paste("Sample Correlation -", dataset_name),
+           filename = paste0("results_", dataset_name, "/heatmap_correlation_", dataset_name, ".png"))
+}
+
+# Generate QC plots for all datasets
+lapply(processed_data, generate_qc_plots)
+
+4. Batch Effect Correction for All Datasets
+r
+
+# Apply batch effect correction to each dataset
+apply_batch_correction <- function(processed_data) {
+  dataset_name <- processed_data$dataset_name
+  dds <- processed_data$dds
+  metadata <- processed_data$metadata
+  
+  # Check if batch information exists in metadata
+  if ("batch" %in% colnames(metadata)) {
+    # Apply batch correction
+    vst_data <- vst(dds)
+    expr_matrix <- assay(vst_data)
+    corrected_matrix <- removeBatchEffect(expr_matrix, batch = metadata$batch)
+    
+    # Save corrected matrix
+    write.table(corrected_matrix, 
+                paste0("results_", dataset_name, "/batch_corrected_", dataset_name, ".txt"),
+                sep = "\t", quote = FALSE)
+    
+    cat("Batch correction applied to", dataset_name, "\n")
+  } else {
+    cat("No batch information found for", dataset_name, "- skipping batch correction\n")
+  }
+}
+
+# Apply batch correction to all datasets
+lapply(processed_data, apply_batch_correction)
+
+5. Differential Expression Analysis for All Datasets
+r
+
+# Perform differential expression analysis for each dataset
+perform_de_analysis <- function(processed_data) {
+  dataset_name <- processed_data$dataset_name
+  dds <- processed_data$dds
+  metadata <- processed_data$metadata
+  
+  # Create results directory
+  dir.create(paste0("results_", dataset_name, "/DE_results"), showWarnings = FALSE)
+  
+  # Check if sex-specific analysis is possible
+  if ("sex" %in% colnames(metadata) && "sample.type" %in% colnames(metadata)) {
+    # Create combined factor for sex-specific analysis
+    metadata$combined <- factor(
+      paste(metadata$sample.type, metadata$sex, sep = "_")
+    )
+    
+    # Update DESeq2 object with new design
+    dds$combined <- metadata$combined
+    design(dds) <- ~ combined
+    dds <- DESeq(dds)
+    
+    # Perform sex-specific comparisons
+    if (all(c("control_female", "case_female") %in% levels(dds$combined))) {
+      res_female <- results(dds, contrast = c("combined", "control_female", "case_female"))
+      write.table(as.data.frame(res_female), 
+                  paste0("results_", dataset_name, "/DE_results/female_DE_", dataset_name, ".txt"),
+                  sep = "\t", quote = FALSE)
+    }
+    
+    if (all(c("control_male", "case_male") %in% levels(dds$combined))) {
+      res_male <- results(dds, contrast = c("combined", "control_male", "case_male"))
+      write.table(as.data.frame(res_male), 
+                  paste0("results_", dataset_name, "/DE_results/male_DE_", dataset_name, ".txt"),
+                  sep = "\t", quote = FALSE)
+    }
+  } else {
+    # Standard case vs control analysis
+    res <- results(dds, contrast = c("sample.type", "case", "control"))
+    write.table(as.data.frame(res), 
+                paste0("results_", dataset_name, "/DE_results/DE_", dataset_name, ".txt"),
+                sep = "\t", quote = FALSE)
+  }
+  
+  cat("Differential expression analysis completed for", dataset_name, "\n")
+}
+
+# Perform DE analysis on all datasets
+lapply(processed_data, perform_de_analysis)
+
+6. Gene Annotation Function
+r
+
+# Function to annotate gene symbols using biomaRt
+annotate_gene_symbols <- function(gene_ids, id_type = "ensembl_gene_id") {
+  # Connect to Ensembl database
+  ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+  
+  # Retrieve official gene symbols from HGNC
+  annotation <- getBM(
+    attributes = c(id_type, "hgnc_symbol", "entrezgene_id", "description"),
+    filters = id_type,
+    values = gene_ids,
+    mart = ensembl
+  )
+  
+  return(annotation)
+}
+
+7. Generate Summary Report
+r
+
+# Create a summary report for all datasets
+generate_summary_report <- function(processed_data) {
+  summary_df <- data.frame(
+    Dataset = character(),
+    Samples = integer(),
+    Genes = integer(),
+    Conditions = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in seq_along(processed_data)) {
+    dataset <- processed_data[[i]]
+    dataset_name <- dataset$dataset_name
+    dds <- dataset$dds
+    metadata <- dataset$metadata
+    
+    # Count conditions
+    if ("sample.type" %in% colnames(metadata)) {
+      conditions <- paste(unique(metadata$sample.type), collapse = ", ")
+    } else {
+      conditions = "Not specified"
+    }
+    
+    # Add to summary
+    summary_df <- rbind(summary_df, data.frame(
+      Dataset = dataset_name,
+      Samples = ncol(dds),
+      Genes = nrow(dds),
+      Conditions = conditions
+    ))
+  }
+  
+  write.table(summary_df, "dataset_summary.txt", sep = "\t", row.names = FALSE)
+  return(summary_df)
+}
+
+# Generate summary report
+dataset_summary <- generate_summary_report(processed_data)
+print(dataset_summary)
+
+Meta-Analysis
+8. SDID Meta-Analysis for All Datasets
+r
+
+# Set working directory and list files
+setwd("D:/geo/BIPOLAR META/high throughput/Final Results/DEXRESULT-all")
+
+# Read DEG results for females
+results_female1 <- read.table("female80336dexresultfinal.txt", row.names = 1)
+results_female2 <- read.table("female42546dexresultfinal.txt", row.names = 1)
+results_female3 <- read.table("female202537bachremoveddexresultfinal.txt", row.names = 1)
+results_female4 <- read.table("female80655bachremoveddexresultfinal.txt", row.names = 1)
+
+# Read DEG results for males
+results_male1 <- read.table("male80336dexresultfinal.txt", row.names = 1)
+results_male2 <- read.table("male42546dexresultfinal.txt", row.names = 1)
+results_male3 <- read.table("male202537bachremoveddexresultfinal.txt", row.names = 1)
+results_male4 <- read.table("male80655bachremoveddexresultfinal.txt", row.names = 1)
+
+# Function to calculate SDID for a study
+calculate_sdid <- function(female_res, male_res) {
+  # Find common genes
+  common_genes <- intersect(rownames(female_res), rownames(male_res))
+  
+  # Calculate SDID (difference between logFC in females and males)
+  sdid_data <- data.frame(
+    gene = common_genes,
+    logFC = female_res[common_genes, "log2FoldChange"] - male_res[common_genes, "log2FoldChange"],
+    lfcSE = sqrt(female_res[common_genes, "lfcSE"]^2 + male_res[common_genes, "lfcSE"]^2),
+    pval = NA  # p-value should be calculated appropriately
+  )
+  
+  # Calculate p-value using z-test
+  sdid_data$pval <- 2 * pnorm(-abs(sdid_data$logFC / sdid_data$lfcSE))
+  
+  sdid_data
+}
+
+# Calculate SDID for each study pair
+sdid1 <- calculate_sdid(results_female1, results_male1)
+sdid2 <- calculate_sdid(results_female2, results_male2)
+sdid3 <- calculate_sdid(results_female3, results_male3)
+sdid4 <- calculate_sdid(results_female4, results_male4)
+
+# Find common genes across all SDID studies
+common_genes_sdid <- Reduce(intersect, list(sdid1$gene, sdid2$gene, sdid3$gene, sdid4$gene))
+writeLines(common_genes_sdid, "common_genes.txt")
+
+# Prepare data for meta-analysis
+meta_sdid <- data.frame(
+  gene = rep(common_genes_sdid, each = 4),
+  study = rep(1:4, times = length(common_genes_sdid)),
+  logFC = c(
+    sdid1[match(common_genes_sdid, sdid1$gene), "logFC"],
+    sdid2[match(common_genes_sdid, sdid2$gene), "logFC"],
+    sdid3[match(common_genes_sdid, sdid3$gene), "logFC"],
+    sdid4[match(common_genes_sdid, sdid4$gene), "logFC"]
+  ),
+  se = c(
+    sdid1[match(common_genes_sdid, sdid1$gene), "lfcSE"],
+    sdid2[match(common_genes_sdid, sdid2$gene), "lfcSE"],
+    sdid3[match(common_genes_sdid, sdid3$gene), "lfcSE"],
+    sdid4[match(common_genes_sdid, sdid4$gene), "lfcSE"]
+  ),
+  pval = c(
+    sdid1[match(common_genes_sdid, sdid1$gene), "pval"],
+    sdid2[match(common_genes_sdid, sdid2$gene), "pval"],
+    sdid3[match(common_genes_sdid, sdid3$gene), "pval"],
+    sdid4[match(common_genes_sdid, sdid4$gene), "pval"]
+  )
+)
+
+# Perform meta-analysis for SDID
+sdid_meta_results <- by(meta_sdid, meta_sdid$gene, function(sub) {
+  tryCatch({
+    rma(yi = sub$logFC, sei = sub$se, method = "REML")
+  }, error = function(e) NULL)
+})
+
+# Convert results to dataframe
+final_sdid_results <- do.call(rbind, lapply(sdid_meta_results, function(x) {
+  if (!is.null(x)) {
+    data.frame(
+      gene = x$slab[1],
+      estimate = x$beta[1],
+      se = x$se,
+      pval = x$pval,
+      ci.lb = x$ci.lb,
+      ci.ub = x$ci.ub,
+      tau2 = x$tau2,
+      I2 = x$I2)
+  }
+}))
+
+# Adjust p-values
+final_sdid_results$padj <- p.adjust(final_sdid_results$pval, method = "BH")
+
+# Save results
+write.csv(final_sdid_results, "meta_analysis_results_sdid.csv", row.names = TRUE)
+
+# Get significant SDID genes
+significant_sdid_genes <- final_sdid_results[final_sdid_results$padj < 0.05, "gene"]
+writeLines(significant_sdid_genes, "significant_sdid_genes.txt")
+
+9. Visualization of Meta-Analysis Results
+r
+
+# Create directory for forest plots
+if (!dir.exists("ForestPlots")) dir.create("ForestPlots")
+
+# Function to draw forest plot for each gene
+draw_forest <- function(gene_name) {
+  # Select data for the gene
+  gene_data <- meta_sdid %>% filter(gene == gene_name)
+  
+  # If no data available
+  if (nrow(gene_data) == 0) {
+    message("⚠ No data found for gene ", gene_name)
+    return()
+  }
+  
+  # Draw forest plot
+  png(paste0("ForestPlots/", gene_name, ".png"), width = 2000, height = 1500, res = 300)
+  forest(
+    rma(yi = logFC, sei = se, data = gene_data),
+    slab = gene_data$study,
+    main = paste("Forest Plot for", gene_name),
+    xlab = "Log2 Fold Change"
+  )
+  dev.off()
+  
+  message("✅ Forest plot saved for gene ", gene_name)
+}
+
+# Create directory for funnel plots
+if (!dir.exists("FunnelPlots")) dir.create("FunnelPlots")
+
+# Function to draw funnel plot for each gene
+draw_funnel <- function(gene_name) {
+  # Select data for the gene
+  gene_data <- meta_sdid %>% filter(gene == gene_name)
+  
+  # If insufficient data (minimum 3 studies)
+  if (nrow(gene_data) < 3) {
+    message("⚠ Insufficient data for gene ", gene_name, " (studies: ", nrow(gene_data), ")")
+    return()
+  }
+  
+  tryCatch({
+    # Perform meta-analysis
+    res <- rma(yi = logFC, sei = se, data = gene_data)
+    
+    # Save high-quality funnel plot
+    png(paste0("FunnelPlots/", gene_name, "_funnel.png"),
+        width = 2000, height = 2000, res = 300)
+    
+    # Draw enhanced funnel plot
+    funnel(res, main = paste("Funnel Plot for", gene_name),
+           xlab = "Log2 Fold Change", ylab = "Standard Error",
+           level = c(90, 95, 99),
+           shade = c("white", "gray75", "gray55"),
+           refline = 0,
+           bg = "lightblue",
+           pch = 21,
+           cex = 1.5)
+    
+    # Add important statistics
+    legend("topright",
+           legend = c(paste("p-value =", formatC(res$pval, format = "e", digits = 2)),
+                      paste("I² =", round(res$I2, 1), "%")),
+           bty = "n")
+    
+    dev.off()
+    
+    message("✅ Funnel plot saved for gene ", gene_name)
+  }, error = function(e) {
+    message("❌ Error processing gene ", gene_name, ": ", e$message)
+  })
+}
+
+# Create directory for sensitivity analysis
+if (!dir.exists("SensitivityAnalysis")) dir.create("SensitivityAnalysis")
+
+# Function for sensitivity analysis
+run_sensitivity <- function(gene_name) {
+  # Select data for the gene
+  gene_data <- meta_sdid %>% filter(gene == gene_name)
+  
+  # If insufficient data (minimum 4 studies)
+  if (nrow(gene_data) < 4) {
+    message("⚠ Insufficient data for sensitivity analysis for gene ", gene_name, " (studies: ", nrow(gene_data), ")")
+    return()
+  }
+  
+  tryCatch({
+    # Perform leave-one-out sensitivity analysis
+    sens <- leave1out(rma(yi = logFC, sei = se, data = gene_data))
+    
+    # Save results as CSV
+    write.csv(sens, paste0("SensitivityAnalysis/", gene_name, "_sensitivity.csv"))
+    
+    # Draw sensitivity plot
+    png(paste0("SensitivityAnalysis/", gene_name, "_sensitivity.png"),
+        width = 2000, height = 1500, res = 300)
+    
+    plot(sens, main = paste("Sensitivity Analysis for", gene_name),
+         xlab = "Log2 Fold Change", ylab = "Study Removed")
+    
+    dev.off()
+    
+    message("✅ Sensitivity analysis saved for gene ", gene_name)
+  }, error = function(e) {
+    message("❌ Error processing gene ", gene_name, ": ", e$message)
+  })
+}
+
+# Run visualizations for significant genes
+lapply(significant_sdid_genes, function(gene) {
+  draw_forest(gene)
+  draw_funnel(gene)
+  run_sensitivity(gene)
+})
+
+10.perform metaregression on age
+# Set working directory
+setwd("D:/geo/BIPOLAR META/high throughput/دگ نهایی ه روشون متاآنالیز انجام شد")
+
+# Read DEG results for females from four different studies
+results_female1 <- read.table("safarzadehfemale80336dexresultfinal.txt", row.names = 1)
+results_female2 <- read.table("safarzadehfemale42546dexresultfinal.txt", row.names = 1)
+results_female3 <- read.table("female202537bachremoveddexresultfinal.txt", row.names = 1)
+results_female4 <- read.table("female80655bachremoveddexresultfinal.txt", row.names = 1)
+
+# Read DEG results for males from four different studies
+results_male1 <- read.table("safarzadehmale80336dexresultfinal.txt", row.names = 1)
+results_male2 <- read.table("safarzadehmale42546dexresultfinal.txt", row.names = 1)
+results_male3 <- read.table("male202537bachremoveddexresultfinal.txt", row.names = 1)
+results_male4 <- read.table("male80655bachremoveddexresultfinal.txt", row.names = 1)
+
+SDID Calculation
+r
+
+# Function to calculate Sex-Differential Expression (SDID) for each study
+calculate_sdid <- function(female_res, male_res) {
+  # Find common genes between female and male results
+  common_genes <- intersect(rownames(female_res), rownames(male_res))
+  
+  # Calculate SDID (difference in log2FoldChange between females and males)
+  sdid_data <- data.frame(
+    gene = common_genes,
+    logFC = female_res[common_genes, "log2FoldChange"] - male_res[common_genes, "log2FoldChange"],
+    lfcSE = sqrt(female_res[common_genes, "lfcSE"]^2 + male_res[common_genes, "lfcSE"]^2),
+    pval = NA  # p-value will be calculated
+  )
+  
+  # Calculate p-value using z-test
+  sdid_data$pval <- 2 * pnorm(-abs(sdid_data$logFC / sdid_data$lfcSE))
+  
+  return(sdid_data)
+}
+
+# Calculate SDID for each study pair
+sdid1 <- calculate_sdid(results_female1, results_male1)
+sdid2 <- calculate_sdid(results_female2, results_male2)
+sdid3 <- calculate_sdid(results_female3, results_male3)
+sdid4 <- calculate_sdid(results_female4, results_male4)
+
+# Find common genes across all SDID studies
+common_genes_sdid <- Reduce(intersect, list(
+  sdid1$gene, 
+  sdid2$gene, 
+  sdid3$gene, 
+  sdid4$gene
+))
+
+Main Meta-Analysis
+r
+
+# Prepare data for meta-analysis
+meta_sdid <- data.frame(
+  gene = rep(common_genes_sdid, each = 4),
+  study = rep(1:4, times = length(common_genes_sdid)),
+  logFC = c(
+    sdid1[match(common_genes_sdid, sdid1$gene), "logFC"],
+    sdid2[match(common_genes_sdid, sdid2$gene), "logFC"],
+    sdid3[match(common_genes_sdid, sdid3$gene), "logFC"],
+    sdid4[match(common_genes_sdid, sdid4$gene), "logFC"]
+  ),
+  se = c(
+    sdid1[match(common_genes_sdid, sdid1$gene), "lfcSE"],
+    sdid2[match(common_genes_sdid, sdid2$gene), "lfcSE"],
+    sdid3[match(common_genes_sdid, sdid3$gene), "lfcSE"],
+    sdid4[match(common_genes_sdid, sdid4$gene), "lfcSE"]
+  )
+)
+
+# Age differences between case and control groups for each study
+age_differences <- data.frame(
+  study = 1:4,
+  age_diff = c(4.17, -22.11, 1.63, -2.35)  # case - control
+)
+
+# Combine data with age information
+library(dplyr)
+meta_data <- meta_sdid %>%
+  left_join(age_differences, by = "study") %>%
+  filter(!is.na(logFC) & !is.na(se) & !is.na(age_diff))
+
+# Main meta-analysis for each gene (without considering age)
+library(metafor)
+
+meta_results <- by(meta_data, meta_data$gene, function(sub) {
+  tryCatch({
+    rma(yi = sub$logFC, sei = sub$se, method = "REML")
+  }, error = function(e) {
+    NULL
+  })
+})
+
+# Convert results to dataframe
+final_results <- do.call(rbind, lapply(names(meta_results), function(gene_name) {
+  x <- meta_results[[gene_name]]
+  if (!is.null(x)) {
+    data.frame(
+      gene = gene_name,
+      estimate = x$beta[1],
+      se = x$se,
+      pval = x$pval,
+      I2 = x$I2,
+      tau2 = x$tau2
+    )
+  } else {
+    data.frame(gene = gene_name, estimate = NA, se = NA, pval = NA, I2 = NA, tau2 = NA)
+  }
+}))
+
+final_results$padj <- p.adjust(final_results$pval, method = "BH")
+
+Age Effect Assessment
+r
+
+# A) Multilevel model to assess overall age effect across all genes
+multilevel_model <- tryCatch({
+  rma.mv(yi = logFC, V = se^2,
+         random = ~ 1 | gene/study,
+         mods = ~ age_diff,
+         data = meta_data,
+         control = list(optimizer = "optim", optmethod = "BFGS"))
+}, error = function(e) {
+  message("Error in multilevel model: ", e$message)
+  NULL
+})
+
+# B) Meta-regression for each gene individually to assess age effects
+gene_meta_regression <- meta_data %>%
+  group_by(gene) %>%
+  filter(n() >= 3) %>%  # Minimum 3 studies per gene
+  group_modify(~ {
+    tryCatch({
+      model <- rma(yi = logFC, sei = se, mods = ~ age_diff, data = .x, method = "REML")
+      data.frame(
+        age_effect = model$beta[2, 1],    # Age effect coefficient
+        age_se = model$se[2],
+        age_pval = model$pval[2],
+        I2 = model$I2,
+        tau2 = model$tau2,
+        n_studies = nrow(.x)
+      )
+    }, error = function(e) {
+      data.frame(age_effect = NA, age_se = NA, age_pval = NA, 
+                 I2 = NA, tau2 = NA, n_studies = nrow(.x))
+    })
+  }) %>%
+  filter(!is.na(age_effect))
+
+gene_meta_regression$age_padj <- p.adjust(gene_meta_regression$age_pval, method = "BH")
+
+# Genes with significant age effects
+significant_age_genes <- gene_meta_regression %>%
+  filter(age_padj < 0.05) %>%
+  arrange(age_padj)
+
+Results
+r
+
+# Save results
+write.csv(final_results, "meta_analysis_main_results.csv", row.names = FALSE)
+write.csv(gene_meta_regression, "meta_regression_age_effects.csv", row.names = FALSE)
+write.csv(significant_age_genes, "significant_age_effect_genes.csv", row.names = FALSE)
+
+# Output results summary
+cat("=== Main Meta-Analysis Results ===\n")
+cat("Number of genes analyzed:", nrow(final_results), "\n")
+cat("Number of significant genes (padj < 0.05):", sum(final_results$padj < 0.05, na.rm = TRUE), "\n")
+
+cat("\n=== Age Effect Assessment Results ===\n")
+if (!is.null(multilevel_model)) {
+  cat("Multilevel model - Overall age effect:\n")
+  print(multilevel_model)
+}
+
+cat("\nIndividual gene age effects:\n")
+cat("Number of genes with significant age effect:", nrow(significant_age_genes), "\n")
+if (nrow(significant_age_genes) > 0) {
+  cat("Top 10 genes with strongest age effect:\n")
+  print(head(significant_age_genes, 10))
+}
+
+# Statistical summary
+cat("\n=== Statistical Summary ===\n")
+cat("Mean age effect across genes:", mean(gene_meta_regression$age_effect, na.rm = TRUE), "\n")
+cat("Number of genes with positive age effect:", sum(gene_meta_regression$age_effect > 0, na.rm = TRUE), "\n")
+cat("Number of genes with negative age effect:", sum(gene_meta_regression$age_effect < 0, na.rm = TRUE), "\n")
+
+
+
+
+Functional Enrichment
+
+11. GO Enrichment Analysis
+r
+
+# Define upregulated and downregulated gene lists from meta-analysis results
+up_genes <- c(
+  "SCLT1", "SASS6", "RUFY3", "RRAS2", "RNF217", "RNF214", "RMND5A", "RHOA", "PSD3", "PPM1A",
+  "POLK", "PIGX", "PHTF2", "PHC3", "PDGFC", "PARVB", "PBRM1", "PALM2-AKAP2", "PABPC1", "OLFM3",
+  "OPRD1", "NUP205", "OGT", "NTRK2", "NTRK3", "NR3C1", "NR6A1", "NLGN1", "NINL", "NARS2",
+  "MYLK", "MTUS1", "MTMR1", "MRPS25", "MLXIP", "MMD2", "GPM6A", "INPP5A", "MARK2", "GARNL3",
+  "GDI2", "GNAS"
+)
+
+down_genes <- c(
+  "MKLN1", "MOB2", "MSH4", "MTMR8", "MYBL2", "MYH7B", "NCAM1", "NOL10", "NRF1", "NUFIP2",
+  "OSBPL6", "OSBPL9", "OTOF", "PAPOLA", "PDE4B", "PDIA3", "PEX5L", "PHLPP1", "PIK3C3", "PKHD1",
+  "PLS1", "PLXNA2", "PNKD", "POLR1B", "POLR2K", "POLR3A", "POM121", "POT1", "PPP2R1B", "PRICKLE2",
+  "PRKAR1B", "PRPF18", "PTPN3", "PWWP2A", "RAI1", "RCAN2", "RGS9", "RNF128", "ROBO1", "RPS6KB1",
+  "SEC31B", "SEC62"
+)
+
+# GO enrichment for biological process
+up_genes_bp <- enrichGO(
+  gene = up_genes,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.1,
+  minGSSize = 3,
+  maxGSSize = 500
+)
+
+down_genes_bp <- enrichGO(
+  gene = down_genes,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.1,
+  minGSSize = 3,
+  maxGSSize = 500
+)
+
+# Add group labels
+up_genes_bp@result$Group <- "LFC>0"
+down_genes_bp@result$Group <- "LFC<0"
+
+# Merge results
+merged_results_bp <- rbind(up_genes_bp@result, down_genes_bp@result)
+
+# Select top pathways
+top_pathways_bp <- merged_results_bp %>%
+  group_by(Group) %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+
+# Truncate long descriptions
+top_pathways_bp$ShortDescription <- stringr::str_trunc(top_pathways_bp$Description, width = 45)
+
+# Save BP results
+write.csv(top_pathways_bp, "top_BP_pathways.csv", row.names = FALSE)
+
+# Create BP dot plot
+ggplot(top_pathways_bp, 
+       aes(x = Group, 
+           y = reorder(ShortDescription, p.adjust),
+           size = Count, 
+           color = -log10(p.adjust))) +
+  geom_point(alpha = 0.7) +
+  scale_color_gradient(low = "blue", high = "red", 
+                       name = "-log10(p.adjust)") +
+  scale_size_continuous(range = c(3, 8), name = "Gene Count") +
+  labs(title = "Top 10 Biological Processes (BP) by Group",
+       x = "Regulation Group",
+       y = "GO Term Description") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 10, face = "bold"),
+    axis.text.x = element_text(size = 12, face = "bold"),
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    panel.grid.major.y = element_line(linetype = "dashed")
+  )
+
+# Save plot
+ggsave("BP_analysis.png", width = 10, height = 7, dpi = 300)
